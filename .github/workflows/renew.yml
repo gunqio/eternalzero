@@ -1,0 +1,32 @@
+name: Auto Renew Server
+
+on:
+  schedule:
+    # 每天 UTC 时间 8:00 运行（即北京时间 16:00），可自行调整
+    - cron: '0 8 * * *'
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run renew script
+        env:
+          PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
+          PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
+          PANEL_URL: ${{ secrets.PANEL_URL }}
+          RENEW_API: ${{ secrets.RENEW_API }}
+          SERVER_ID: ${{ secrets.SERVER_ID }}
+        run: python renew.py
