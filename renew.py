@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Eternal Hosting 自动续期（修正冷却检测 + 数字ID续期）
+Eternal Hosting 自动续期（修正数字ID + 冷却检测增强）
 """
 
 import os
@@ -14,10 +14,10 @@ import requests
 PANEL_URL = os.getenv("PANEL_URL", "https://eternalzero.cloud").rstrip("/")
 USERNAME = os.getenv("PANEL_USERNAME")
 PASSWORD = os.getenv("PANEL_PASSWORD")
-SERVER_ID = os.getenv("SERVER_ID", "6423")          # 改为数字 ID
+SERVER_ID = os.getenv("SERVER_ID", "6423")          # 数字ID
 LOGIN_URL = os.getenv("LOGIN_URL", f"{PANEL_URL}/login")
-INFO_PAGE = os.getenv("INFO_PAGE", f"/servers/{SERVER_ID}/info")  # 使用数字 ID
-RENEW_API = os.getenv("RENEW_API", f"/servers/{SERVER_ID}/renew") # 使用数字 ID
+INFO_PAGE = os.getenv("INFO_PAGE", f"/servers/{SERVER_ID}/info")
+RENEW_API = os.getenv("RENEW_API", f"/servers/{SERVER_ID}/renew")
 WAIT = os.getenv("WAIT_FOR_COOLDOWN", "false").lower() == "true"
 
 logging.basicConfig(
@@ -58,13 +58,21 @@ def get_csrf_token_from_page(session, url):
         return None
 
 def parse_cooldown(html):
-    """
-    从 HTML 中解析冷却倒计时，支持多种格式：
-    - "You can renew again in 1h 23m"
-    - "1h 23m"
-    - "23m"
-    - "Resets ... 23h 49m left" (备选)
-    """
+    """优先从 div#cooldown-display 中提取，否则从全文匹配"""
+    # 定位冷却显示div
+    match = re.search(r'<div[^>]*id="cooldown-display"[^>]*>(.*?)</div>', html, re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+        # 提取类似 "1h 23m" 或 "23m"
+        time_match = re.search(r'(\d+)h\s+(\d+)m', text)
+        if time_match:
+            h, m = int(time_match.group(1)), int(time_match.group(2))
+            return h * 3600 + m * 60
+        time_match = re.search(r'(\d+)m', text)
+        if time_match:
+            return int(time_match.group(1)) * 60
+        # 如果只有数字（如 "83m"），但已覆盖
+    # 备用全文搜索
     patterns = [
         r'You can renew again in\s+(\d+)h\s+(\d+)m',
         r'You can renew again in\s+(\d+)h\s+(\d+)\s*min',
@@ -72,19 +80,15 @@ def parse_cooldown(html):
         r'(\d+)h\s+(\d+)m\s+left',
         r'(\d+)h\s+(\d+)\s*min\s+left',
         r'(\d+)m\s+left',
-        r'You can renew again in\s+(\d+)\s*minutes?',   # 纯分钟
     ]
     for pat in patterns:
         match = re.search(pat, html, re.IGNORECASE)
         if match:
             groups = match.groups()
             if len(groups) == 2:
-                h, m = int(groups[0]), int(groups[1])
-                return h * 3600 + m * 60
+                return int(groups[0]) * 3600 + int(groups[1]) * 60
             elif len(groups) == 1:
-                # 可能是分钟
-                m = int(groups[0])
-                return m * 60
+                return int(groups[0]) * 60
     return 0
 
 def login(session):
@@ -176,10 +180,6 @@ def check_and_handle_cooldown(session):
         resp.raise_for_status()
         html = resp.text
 
-        # 调试：保存HTML到文件，便于查看（可选）
-        # with open("page.html", "w", encoding="utf-8") as f:
-        #     f.write(html)
-
         cooldown_seconds = parse_cooldown(html)
         if cooldown_seconds > 0:
             hours = cooldown_seconds // 3600
@@ -197,7 +197,6 @@ def check_and_handle_cooldown(session):
             return True
     except Exception as e:
         logger.error("检查冷却失败: %s", e)
-        # 如果无法检查，假设无冷却继续尝试（可能导致失败，但不会阻止）
         return True
 
 def main():
