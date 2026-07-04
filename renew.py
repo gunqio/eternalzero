@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Eternal Hosting 自动续期（带冷却检测）
+Eternal Hosting 自动续期（修正冷却检测 + 数字ID续期）
 """
 
 import os
@@ -11,15 +11,14 @@ import time
 import logging
 import requests
 
-# ---------- 配置 ----------
 PANEL_URL = os.getenv("PANEL_URL", "https://eternalzero.cloud").rstrip("/")
 USERNAME = os.getenv("PANEL_USERNAME")
 PASSWORD = os.getenv("PANEL_PASSWORD")
-SERVER_ID = os.getenv("SERVER_ID", "sxdazg")
+SERVER_ID = os.getenv("SERVER_ID", "6423")          # 改为数字 ID
 LOGIN_URL = os.getenv("LOGIN_URL", f"{PANEL_URL}/login")
-INFO_PAGE = os.getenv("INFO_PAGE", f"/servers/6423/info")   # 根据实际调整
-RENEW_API = os.getenv("RENEW_API", f"/servers/{SERVER_ID}/renew")
-WAIT = os.getenv("WAIT_FOR_COOLDOWN", "false").lower() == "true"  # 是否等待
+INFO_PAGE = os.getenv("INFO_PAGE", f"/servers/{SERVER_ID}/info")  # 使用数字 ID
+RENEW_API = os.getenv("RENEW_API", f"/servers/{SERVER_ID}/renew") # 使用数字 ID
+WAIT = os.getenv("WAIT_FOR_COOLDOWN", "false").lower() == "true"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,7 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- 辅助函数 ----------
 def check_env():
     missing = []
     if not USERNAME:
@@ -40,7 +38,6 @@ def check_env():
         sys.exit(1)
 
 def get_csrf_token_from_page(session, url):
-    """从任意页面提取 CSRF Token"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -49,7 +46,6 @@ def get_csrf_token_from_page(session, url):
         resp = session.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         html = resp.text
-        # meta 优先
         match = re.search(r'<meta[^>]*name="csrf-token"[^>]*content="([^"]+)"', html)
         if match:
             return match.group(1)
@@ -63,26 +59,32 @@ def get_csrf_token_from_page(session, url):
 
 def parse_cooldown(html):
     """
-    从 HTML 中解析冷却倒计时
-    返回剩余秒数，若无冷却则返回 0
+    从 HTML 中解析冷却倒计时，支持多种格式：
+    - "You can renew again in 1h 23m"
+    - "1h 23m"
+    - "23m"
+    - "Resets ... 23h 49m left" (备选)
     """
-    # 匹配 "You can renew again in 1h 23m" 或 "1h 23m"
     patterns = [
         r'You can renew again in\s+(\d+)h\s+(\d+)m',
         r'You can renew again in\s+(\d+)h\s+(\d+)\s*min',
-        r'You can renew again in\s+(\d+)m',   # 仅分钟
-        r'(\d+)h\s+(\d+)m\s+left',           # 备选
+        r'You can renew again in\s+(\d+)m',
+        r'(\d+)h\s+(\d+)m\s+left',
+        r'(\d+)h\s+(\d+)\s*min\s+left',
+        r'(\d+)m\s+left',
+        r'You can renew again in\s+(\d+)\s*minutes?',   # 纯分钟
     ]
     for pat in patterns:
         match = re.search(pat, html, re.IGNORECASE)
         if match:
             groups = match.groups()
             if len(groups) == 2:
-                hours, minutes = int(groups[0]), int(groups[1])
-                return hours * 3600 + minutes * 60
+                h, m = int(groups[0]), int(groups[1])
+                return h * 3600 + m * 60
             elif len(groups) == 1:
-                minutes = int(groups[0])
-                return minutes * 60
+                # 可能是分钟
+                m = int(groups[0])
+                return m * 60
     return 0
 
 def login(session):
@@ -116,8 +118,6 @@ def login(session):
         return False
 
 def renew_server(session):
-    """执行续期（必须先确保无冷却）"""
-    # 获取 CSRF Token（从信息页）
     info_url = f"{PANEL_URL}{INFO_PAGE}"
     token = get_csrf_token_from_page(session, info_url)
     if not token:
@@ -165,7 +165,6 @@ def renew_server(session):
         return False
 
 def check_and_handle_cooldown(session):
-    """检查冷却，如果有则处理（等待或退出）"""
     info_url = f"{PANEL_URL}{INFO_PAGE}"
     logger.info("检查冷却状态: %s", info_url)
     try:
@@ -177,6 +176,10 @@ def check_and_handle_cooldown(session):
         resp.raise_for_status()
         html = resp.text
 
+        # 调试：保存HTML到文件，便于查看（可选）
+        # with open("page.html", "w", encoding="utf-8") as f:
+        #     f.write(html)
+
         cooldown_seconds = parse_cooldown(html)
         if cooldown_seconds > 0:
             hours = cooldown_seconds // 3600
@@ -185,10 +188,8 @@ def check_and_handle_cooldown(session):
             if WAIT:
                 logger.info("等待 %d 秒后继续...", cooldown_seconds + 10)
                 time.sleep(cooldown_seconds + 10)
-                # 等待后重新检查（可选，这里直接返回 True 继续执行）
                 return True
             else:
-                # 不等待，正常退出（状态码 0）
                 logger.info("跳过本次续期，等待下次定时任务")
                 sys.exit(0)
         else:
@@ -196,7 +197,7 @@ def check_and_handle_cooldown(session):
             return True
     except Exception as e:
         logger.error("检查冷却失败: %s", e)
-        # 无法判断时，默认继续尝试续期（可能失败）
+        # 如果无法检查，假设无冷却继续尝试（可能导致失败，但不会阻止）
         return True
 
 def main():
@@ -217,11 +218,9 @@ def main():
     if not login(session):
         sys.exit(1)
 
-    # 检查冷却
     if not check_and_handle_cooldown(session):
-        sys.exit(0)  # 冷却处理已退出或继续
+        sys.exit(0)
 
-    # 执行续期
     if renew_server(session):
         logger.info("自动续期完成")
         sys.exit(0)
