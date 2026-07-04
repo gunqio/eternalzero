@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Eternal Hosting 服务器自动续期脚本（支持 CSRF Token）
+Eternal Hosting 服务器自动续期脚本（无第三方解析库，纯正则提取 CSRF Token）
 用于 GitHub Actions 定时运行
 """
 
@@ -11,16 +11,15 @@ import json
 import logging
 from datetime import datetime
 import requests
-from bs4 import BeautifulSoup
 
-# ---------- 配置 ----------
+# ---------- 配置（从环境变量读取） ----------
 PANEL_URL = os.getenv("PANEL_URL", "https://eternalzero.cloud").rstrip("/")
 USERNAME = os.getenv("PANEL_USERNAME")
 PASSWORD = os.getenv("PANEL_PASSWORD")
 SERVER_ID = os.getenv("SERVER_ID")
-# 登录接口（完整 URL 或相对路径均可）
+# 登录 URL（可覆盖）
 LOGIN_URL = os.getenv("LOGIN_URL", f"{PANEL_URL}/login")
-# 续期接口（可包含占位符 {server_id}）
+# 续期 API（支持 {server_id} 占位符）
 RENEW_API = os.getenv("RENEW_API", f"/servers/{SERVER_ID}/renew")
 
 # 日志配置
@@ -45,30 +44,29 @@ def check_env():
         sys.exit(1)
 
 def get_csrf_token(session, login_page_url):
-    """
-    访问登录页面，从 HTML 中提取 CSRF Token
-    返回 token 字符串，若未找到则返回 None
-    """
+    """通过正则表达式从登录页 HTML 中提取 CSRF Token"""
     logger.info("正在获取 CSRF Token ...")
     try:
         resp = session.get(login_page_url, timeout=30)
         resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # 查找 <input type="hidden" name="_token" value="...">
-        token_input = soup.find("input", {"name": "_token"})
-        if token_input and token_input.get("value"):
-            token = token_input["value"]
-            logger.info("CSRF Token 获取成功")
+        html = resp.text
+
+        # 方式1：匹配 <input type="hidden" name="_token" value="...">
+        match = re.search(r'<input[^>]*name="_token"[^>]*value="([^"]+)"', html)
+        if match:
+            token = match.group(1)
+            logger.info("CSRF Token 获取成功 (input)")
             return token
-        else:
-            # 尝试通过 meta 标签
-            meta_token = soup.find("meta", {"name": "csrf-token"})
-            if meta_token and meta_token.get("content"):
-                token = meta_token["content"]
-                logger.info("CSRF Token 获取成功 (from meta)")
-                return token
-            logger.error("未能在登录页面找到 CSRF Token")
-            return None
+
+        # 方式2：匹配 <meta name="csrf-token" content="...">
+        match = re.search(r'<meta[^>]*name="csrf-token"[^>]*content="([^"]+)"', html)
+        if match:
+            token = match.group(1)
+            logger.info("CSRF Token 获取成功 (meta)")
+            return token
+
+        logger.error("未能在登录页面找到 CSRF Token")
+        return None
     except Exception as e:
         logger.error("获取 CSRF Token 失败: %s", e)
         return None
@@ -81,39 +79,37 @@ def login(session):
         logger.error("无法获取 CSRF Token，登录终止")
         return False
 
-    # 准备登录数据
+    # 准备登录数据（Laravel 需要 _token）
     payload = {
         "_token": token,
-        "username": USERNAME,   # 或 "email"，请根据实际字段调整
+        "username": USERNAME,   # 也可能是 "email"，根据实际字段调整
         "password": PASSWORD,
     }
-    # 可能还需要其他隐藏字段，如 "remember"，但一般不是必需的
+    # 如果有 "remember" 选项，可以添加
+    # payload["remember"] = "on"
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
         "Referer": LOGIN_URL,
         "Origin": PANEL_URL,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
+
     logger.info("正在登录 %s ...", LOGIN_URL)
     try:
-        # POST 登录请求
+        # POST 登录请求（使用 data 而不是 json，因为表单提交）
         resp = session.post(LOGIN_URL, data=payload, headers=headers, timeout=30)
         resp.raise_for_status()
-        # 判断登录是否成功（可根据响应内容或状态码）
-        # 通常登录成功会重定向到仪表板，或者返回 JSON
-        if resp.status_code == 200:
-            # 检查响应内容是否包含登录失败信息
-            if "login" in resp.url or "login" in resp.text.lower():
-                logger.error("登录失败，可能用户名或密码错误")
-                return False
-            logger.info("登录成功")
-            return True
-        elif resp.status_code in [302, 301]:
-            # 重定向通常表示登录成功
-            logger.info("登录成功（重定向）")
-            return True
-        else:
-            logger.error("登录异常，状态码: %s", resp.status_code)
+
+        # 登录成功通常会重定向到仪表板，或者返回 200 并包含 "dashboard" 等
+        # 如果返回的页面内容包含 "login" 字样且无重定向，可能失败
+        if "login" in resp.url.lower():
+            # 如果当前 URL 仍然是登录页，说明登录失败
+            logger.error("登录失败，可能用户名或密码错误")
             return False
+        logger.info("登录成功")
+        return True
     except requests.exceptions.RequestException as e:
         logger.error("登录请求失败: %s", e)
         return False
@@ -129,8 +125,6 @@ def renew_server(session):
     renew_url = renew_url.replace("{server_id}", SERVER_ID)
     logger.info("正在续期: %s", renew_url)
 
-    # 续期请求通常需要 CSRF Token，可以从 session 中获取（如果有 cookie）
-    # 但根据抓包，续期接口可能只需要 cookie 认证
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
         "Referer": f"{PANEL_URL}/servers/{SERVER_ID}",
@@ -138,14 +132,11 @@ def renew_server(session):
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "application/json",
     }
-    # 如果续期需要 CSRF Token 作为请求头，可从 session 中取，但通常 session 已包含
-    # 若需要，可以从 session.cookies 中获取，但此处省略
 
     try:
-        # POST 续期请求，body 可能为空
+        # POST 请求，body 通常为空 JSON
         resp = session.post(renew_url, json={}, headers=headers, timeout=30)
         resp.raise_for_status()
-        # 解析响应
         result = resp.json()
         if result.get("success") or result.get("status") == "success":
             logger.info("✅ 续期成功！")
