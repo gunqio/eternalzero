@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Eternal Hosting 服务器自动续期脚本（无第三方解析库，纯正则提取 CSRF Token）
-用于 GitHub Actions 定时运行
+Eternal Hosting 服务器自动续期脚本
+登录地址：https://eternalzero.cloud/login
+依赖：requests（pip install requests）
 """
 
 import os
@@ -9,17 +10,14 @@ import sys
 import re
 import json
 import logging
-from datetime import datetime
 import requests
 
-# ---------- 配置（从环境变量读取） ----------
+# ---------- 从环境变量读取配置 ----------
 PANEL_URL = os.getenv("PANEL_URL", "https://eternalzero.cloud").rstrip("/")
-USERNAME = os.getenv("PANEL_USERNAME")
+USERNAME = os.getenv("PANEL_USERNAME")          # 登录邮箱
 PASSWORD = os.getenv("PANEL_PASSWORD")
-SERVER_ID = os.getenv("SERVER_ID")
-# 登录 URL（可覆盖）
+SERVER_ID = os.getenv("SERVER_ID")              # 例如 sxdazg
 LOGIN_URL = os.getenv("LOGIN_URL", f"{PANEL_URL}/login")
-# 续期 API（支持 {server_id} 占位符）
 RENEW_API = os.getenv("RENEW_API", f"/servers/{SERVER_ID}/renew")
 
 # 日志配置
@@ -31,7 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def check_env():
-    """检查必要的环境变量是否已设置"""
+    """检查必需的环境变量"""
     missing = []
     if not USERNAME:
         missing.append("PANEL_USERNAME")
@@ -44,21 +42,21 @@ def check_env():
         sys.exit(1)
 
 def get_csrf_token(session, login_page_url):
-    """通过正则表达式从登录页 HTML 中提取 CSRF Token"""
+    """从登录页 HTML 中提取 CSRF Token（使用正则）"""
     logger.info("正在获取 CSRF Token ...")
     try:
         resp = session.get(login_page_url, timeout=30)
         resp.raise_for_status()
         html = resp.text
 
-        # 方式1：匹配 <input type="hidden" name="_token" value="...">
+        # 查找 <input type="hidden" name="_token" value="...">
         match = re.search(r'<input[^>]*name="_token"[^>]*value="([^"]+)"', html)
         if match:
             token = match.group(1)
-            logger.info("CSRF Token 获取成功 (input)")
+            logger.info("CSRF Token 获取成功")
             return token
 
-        # 方式2：匹配 <meta name="csrf-token" content="...">
+        # 备选：<meta name="csrf-token" content="...">
         match = re.search(r'<meta[^>]*name="csrf-token"[^>]*content="([^"]+)"', html)
         if match:
             token = match.group(1)
@@ -72,40 +70,35 @@ def get_csrf_token(session, login_page_url):
         return None
 
 def login(session):
-    """登录面板，获取会话（Cookie）"""
-    # 先获取 CSRF Token
+    """登录面板"""
     token = get_csrf_token(session, LOGIN_URL)
     if not token:
         logger.error("无法获取 CSRF Token，登录终止")
         return False
 
-    # 准备登录数据（Laravel 需要 _token）
+    # 登录表单数据（字段名来自网页源码）
     payload = {
         "_token": token,
-        "username": USERNAME,   # 也可能是 "email"，根据实际字段调整
+        "email": USERNAME,      # 重要：字段名是 email，不是 username
         "password": PASSWORD,
+        # "remember": "on"     // 如果需要记住登录，可取消注释
     }
-    # 如果有 "remember" 选项，可以添加
-    # payload["remember"] = "on"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": LOGIN_URL,
         "Origin": PANEL_URL,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
 
     logger.info("正在登录 %s ...", LOGIN_URL)
     try:
-        # POST 登录请求（使用 data 而不是 json，因为表单提交）
         resp = session.post(LOGIN_URL, data=payload, headers=headers, timeout=30)
         resp.raise_for_status()
 
-        # 登录成功通常会重定向到仪表板，或者返回 200 并包含 "dashboard" 等
-        # 如果返回的页面内容包含 "login" 字样且无重定向，可能失败
+        # 登录成功后通常会重定向到 /servers 或 /dashboard
         if "login" in resp.url.lower():
-            # 如果当前 URL 仍然是登录页，说明登录失败
             logger.error("登录失败，可能用户名或密码错误")
             return False
         logger.info("登录成功")
@@ -115,18 +108,17 @@ def login(session):
         return False
 
 def renew_server(session):
-    """执行续期操作"""
-    # 构建续期 URL
+    """执行续期"""
     if RENEW_API.startswith("http"):
         renew_url = RENEW_API
     else:
         renew_url = f"{PANEL_URL}{RENEW_API}"
-    # 替换占位符
     renew_url = renew_url.replace("{server_id}", SERVER_ID)
+
     logger.info("正在续期: %s", renew_url)
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": f"{PANEL_URL}/servers/{SERVER_ID}",
         "Origin": PANEL_URL,
         "X-Requested-With": "XMLHttpRequest",
@@ -134,7 +126,6 @@ def renew_server(session):
     }
 
     try:
-        # POST 请求，body 通常为空 JSON
         resp = session.post(renew_url, json={}, headers=headers, timeout=30)
         resp.raise_for_status()
         result = resp.json()
@@ -145,22 +136,16 @@ def renew_server(session):
             error_msg = result.get("message") or result.get("error") or "未知错误"
             logger.error("续期失败: %s", error_msg)
             return False
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         logger.error("续期请求异常: %s", e)
-        if e.response:
-            logger.error("响应内容: %s", e.response.text[:200])
-        return False
-    except json.JSONDecodeError:
-        logger.error("续期响应不是有效的 JSON，可能接口路径错误")
         return False
 
 def main():
     check_env()
     session = requests.Session()
-    # 设置默认请求头
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     })
 
