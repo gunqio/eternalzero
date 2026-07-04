@@ -2,15 +2,14 @@ name: Auto Renew Server
 
 on:
   schedule:
-    # 每天 UTC 8:00（北京时间 16:00）运行
-    - cron: '0 8 * * *'
+    - cron: '0 8 * * *'   # 每天 UTC 8:00
   workflow_dispatch:
 
 jobs:
   renew:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -18,16 +17,14 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
+      - name: Install requests
+        run: pip install requests
 
-      - name: Run renew script
+      - name: Run renew
         env:
           PANEL_URL: ${{ secrets.PANEL_URL }}
           PANEL_USERNAME: ${{ secrets.PANEL_USERNAME }}
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
-          LOGIN_URL: ${{ secrets.LOGIN_URL }}        # 可选，默认 https://eternalzero.cloud/login
-          RENEW_API: ${{ secrets.RENEW_API }}        # 例如 /servers/sxdazg/renew
+          RENEW_API: ${{ secrets.RENEW_API }}
         run: python renew.py
