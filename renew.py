@@ -17,8 +17,14 @@ PASSWORD = os.getenv("PANEL_PASSWORD")
 SERVER_ID = os.getenv("SERVER_ID", "6423")
 LOGIN_URL = os.getenv("LOGIN_URL", f"{PANEL_URL}/login")
 INFO_PAGE = os.getenv("INFO_PAGE", f"/servers/{SERVER_ID}/info")
-# 修正默认续期 API
-RENEW_API = os.getenv("RENEW_API", f"/proxycheck-renew/{SERVER_ID}")
+
+# 处理 RENEW_API：如果环境变量未设置或为空，使用默认值
+RENEW_API_ENV = os.getenv("RENEW_API")
+if RENEW_API_ENV:
+    RENEW_API = RENEW_API_ENV
+else:
+    RENEW_API = f"/proxycheck-renew/{SERVER_ID}"
+
 WAIT = os.getenv("WAIT_FOR_COOLDOWN", "false").lower() == "true"
 
 logging.basicConfig(
@@ -116,7 +122,6 @@ def login(session):
     try:
         resp = session.post(LOGIN_URL, data=payload, headers=headers, timeout=30)
         resp.raise_for_status()
-        # 如果登录后跳转到 login 页面，说明失败
         if "login" in resp.url.lower():
             logger.error("登录失败，可能用户名或密码错误")
             return False
@@ -167,11 +172,12 @@ def renew_server(session):
         logger.error("无法获取 CSRF Token，续期终止")
         return False
 
-    # 2. 构造续期 URL
-    if RENEW_API.startswith("http"):
-        renew_url = RENEW_API
+    # 2. 构造续期 URL（确保 RENEW_API 已正确定义）
+    renew_api = RENEW_API if RENEW_API else f"/proxycheck-renew/{SERVER_ID}"
+    if renew_api.startswith("http"):
+        renew_url = renew_api
     else:
-        renew_url = f"{PANEL_URL}{RENEW_API}"
+        renew_url = f"{PANEL_URL}{renew_api}"
     renew_url = renew_url.replace("{server_id}", SERVER_ID)
 
     logger.info("正在续期: %s", renew_url)
@@ -183,28 +189,39 @@ def renew_server(session):
         "Origin": PANEL_URL,
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
-        "x-csrf-token": token,              # 关键：使用页面上的 csrf-token
+        "x-csrf-token": token,
     }
-    # 可选：添加 X-XSRF-TOKEN（从 cookie 获取）
     xsrf = session.cookies.get('XSRF-TOKEN')
     if xsrf:
         headers['X-XSRF-TOKEN'] = xsrf
+
+    # 调试：打印请求信息（隐藏敏感 token）
+    safe_headers = {k: v for k, v in headers.items() if k not in ['x-csrf-token', 'X-XSRF-TOKEN']}
+    logger.info("请求 Headers (脱敏): %s", safe_headers)
+    logger.info("请求 Body: {}")
 
     # 4. 请求体为空 JSON
     payload = {}
 
     try:
         resp = session.post(renew_url, json=payload, headers=headers, timeout=30)
+        logger.info("响应状态码: %s", resp.status_code)
+        logger.info("响应内容: %s", resp.text[:500])
         resp.raise_for_status()
         result = resp.json()
-        # 判断成功条件（根据实际响应调整）
-        if result.get("success") or result.get("status") == "success" or result.get("message") == "Server renewed successfully":
+        if result.get("success") or result.get("status") == "success" or "success" in str(result).lower():
             logger.info("✅ 续期成功！")
             return True
         else:
             error_msg = result.get("message") or result.get("error") or "未知错误"
             logger.error("续期失败: %s", error_msg)
             return False
+    except requests.exceptions.HTTPError as e:
+        logger.error("HTTP 错误: %s", e)
+        if hasattr(e, 'response') and e.response:
+            logger.error("响应状态码: %s", e.response.status_code)
+            logger.error("响应内容: %s", e.response.text[:500])
+        return False
     except Exception as e:
         logger.error("续期请求异常: %s", e)
         if hasattr(e, 'response') and e.response:
