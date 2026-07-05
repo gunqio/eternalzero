@@ -17,8 +17,11 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install requests
-        run: pip install requests
+      - name: Install dependencies
+        run: |
+          pip install requests
+          # 如果使用 SOCKS5 代理，需要安装 pysocks（这里无条件安装，无副作用）
+          pip install pysocks
 
       - name: Run renew
         env:
@@ -27,4 +30,12 @@ jobs:
           PANEL_PASSWORD: ${{ secrets.PANEL_PASSWORD }}
           SERVER_ID: ${{ secrets.SERVER_ID }}
           RENEW_API: ${{ secrets.RENEW_API }}
+          # 代理配置（可选），格式：http://user:pass@host:port 或 socks5://host:port
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          # Telegram 通知（可选）
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # 其他可选参数
+          THRESHOLD_HOURS: ${{ secrets.THRESHOLD_HOURS }}
+          WAIT_FOR_COOLDOWN: ${{ secrets.WAIT_FOR_COOLDOWN }}
         run: python renew.py
