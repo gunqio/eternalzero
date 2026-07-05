@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Eternal Hosting 自动续期（修正数字ID + 冷却检测增强）
+Eternal Hosting 自动续期（使用 /proxycheck-renew API）
 """
 
 import os
 import sys
 import re
-import json
 import time
 import logging
 import requests
 
+# ---------- 环境变量 ----------
 PANEL_URL = os.getenv("PANEL_URL", "https://eternalzero.cloud").rstrip("/")
 USERNAME = os.getenv("PANEL_USERNAME")
 PASSWORD = os.getenv("PANEL_PASSWORD")
-SERVER_ID = os.getenv("SERVER_ID", "6423")          # 数字ID
+SERVER_ID = os.getenv("SERVER_ID", "6423")
 LOGIN_URL = os.getenv("LOGIN_URL", f"{PANEL_URL}/login")
 INFO_PAGE = os.getenv("INFO_PAGE", f"/servers/{SERVER_ID}/info")
-RENEW_API = os.getenv("RENEW_API", f"/servers/{SERVER_ID}/renew")
+# 修正默认续期 API
+RENEW_API = os.getenv("RENEW_API", f"/proxycheck-renew/{SERVER_ID}")
 WAIT = os.getenv("WAIT_FOR_COOLDOWN", "false").lower() == "true"
 
 logging.basicConfig(
@@ -27,6 +28,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ---------- 辅助函数 ----------
 def check_env():
     missing = []
     if not USERNAME:
@@ -38,6 +40,7 @@ def check_env():
         sys.exit(1)
 
 def get_csrf_token_from_page(session, url):
+    """从 HTML 页面中提取 CSRF Token（meta 或 input）"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -46,9 +49,11 @@ def get_csrf_token_from_page(session, url):
         resp = session.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
         html = resp.text
+        # 尝试从 meta 标签获取
         match = re.search(r'<meta[^>]*name="csrf-token"[^>]*content="([^"]+)"', html)
         if match:
             return match.group(1)
+        # 尝试从 input 隐藏域获取
         match = re.search(r'<input[^>]*name="_token"[^>]*value="([^"]+)"', html)
         if match:
             return match.group(1)
@@ -58,12 +63,11 @@ def get_csrf_token_from_page(session, url):
         return None
 
 def parse_cooldown(html):
-    """优先从 div#cooldown-display 中提取，否则从全文匹配"""
+    """从页面中解析冷却剩余时间（秒）"""
     # 定位冷却显示div
     match = re.search(r'<div[^>]*id="cooldown-display"[^>]*>(.*?)</div>', html, re.DOTALL)
     if match:
         text = match.group(1).strip()
-        # 提取类似 "1h 23m" 或 "23m"
         time_match = re.search(r'(\d+)h\s+(\d+)m', text)
         if time_match:
             h, m = int(time_match.group(1)), int(time_match.group(2))
@@ -71,8 +75,7 @@ def parse_cooldown(html):
         time_match = re.search(r'(\d+)m', text)
         if time_match:
             return int(time_match.group(1)) * 60
-        # 如果只有数字（如 "83m"），但已覆盖
-    # 备用全文搜索
+    # 备用全文匹配
     patterns = [
         r'You can renew again in\s+(\d+)h\s+(\d+)m',
         r'You can renew again in\s+(\d+)h\s+(\d+)\s*min',
@@ -91,6 +94,7 @@ def parse_cooldown(html):
                 return int(groups[0]) * 60
     return 0
 
+# ---------- 登录 ----------
 def login(session):
     token = get_csrf_token_from_page(session, LOGIN_URL)
     if not token:
@@ -112,6 +116,7 @@ def login(session):
     try:
         resp = session.post(LOGIN_URL, data=payload, headers=headers, timeout=30)
         resp.raise_for_status()
+        # 如果登录后跳转到 login 页面，说明失败
         if "login" in resp.url.lower():
             logger.error("登录失败，可能用户名或密码错误")
             return False
@@ -121,53 +126,7 @@ def login(session):
         logger.error("登录请求失败: %s", e)
         return False
 
-def renew_server(session):
-    info_url = f"{PANEL_URL}{INFO_PAGE}"
-    token = get_csrf_token_from_page(session, info_url)
-    if not token:
-        logger.error("无法获取 CSRF Token，续期终止")
-        return False
-
-    if RENEW_API.startswith("http"):
-        renew_url = RENEW_API
-    else:
-        renew_url = f"{PANEL_URL}{RENEW_API}"
-    renew_url = renew_url.replace("{server_id}", SERVER_ID)
-
-    logger.info("正在续期: %s", renew_url)
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": info_url,
-        "Origin": PANEL_URL,
-        "X-Requested-With": "XMLHttpRequest",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    xsrf = session.cookies.get('XSRF-TOKEN')
-    if xsrf:
-        headers['X-XSRF-TOKEN'] = xsrf
-
-    payload = {"_token": token}
-
-    try:
-        resp = session.post(renew_url, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get("success") or result.get("status") == "success":
-            logger.info("✅ 续期成功！")
-            return True
-        else:
-            error_msg = result.get("message") or result.get("error") or "未知错误"
-            logger.error("续期失败: %s", error_msg)
-            return False
-    except Exception as e:
-        logger.error("续期请求异常: %s", e)
-        if hasattr(e, 'response') and e.response:
-            logger.error("响应状态码: %s", e.response.status_code)
-            logger.error("响应内容: %s", e.response.text[:500])
-        return False
-
+# ---------- 冷却检查 ----------
 def check_and_handle_cooldown(session):
     info_url = f"{PANEL_URL}{INFO_PAGE}"
     logger.info("检查冷却状态: %s", info_url)
@@ -199,6 +158,61 @@ def check_and_handle_cooldown(session):
         logger.error("检查冷却失败: %s", e)
         return True
 
+# ---------- 续期核心 ----------
+def renew_server(session):
+    # 1. 获取 CSRF Token（从信息页获取）
+    info_url = f"{PANEL_URL}{INFO_PAGE}"
+    token = get_csrf_token_from_page(session, info_url)
+    if not token:
+        logger.error("无法获取 CSRF Token，续期终止")
+        return False
+
+    # 2. 构造续期 URL
+    if RENEW_API.startswith("http"):
+        renew_url = RENEW_API
+    else:
+        renew_url = f"{PANEL_URL}{RENEW_API}"
+    renew_url = renew_url.replace("{server_id}", SERVER_ID)
+
+    logger.info("正在续期: %s", renew_url)
+
+    # 3. 构造请求头
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": info_url,
+        "Origin": PANEL_URL,
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "x-csrf-token": token,              # 关键：使用页面上的 csrf-token
+    }
+    # 可选：添加 X-XSRF-TOKEN（从 cookie 获取）
+    xsrf = session.cookies.get('XSRF-TOKEN')
+    if xsrf:
+        headers['X-XSRF-TOKEN'] = xsrf
+
+    # 4. 请求体为空 JSON
+    payload = {}
+
+    try:
+        resp = session.post(renew_url, json=payload, headers=headers, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        # 判断成功条件（根据实际响应调整）
+        if result.get("success") or result.get("status") == "success" or result.get("message") == "Server renewed successfully":
+            logger.info("✅ 续期成功！")
+            return True
+        else:
+            error_msg = result.get("message") or result.get("error") or "未知错误"
+            logger.error("续期失败: %s", error_msg)
+            return False
+    except Exception as e:
+        logger.error("续期请求异常: %s", e)
+        if hasattr(e, 'response') and e.response:
+            logger.error("响应状态码: %s", e.response.status_code)
+            logger.error("响应内容: %s", e.response.text[:500])
+        return False
+
+# ---------- 主流程 ----------
 def main():
     check_env()
     logger.info("PANEL_URL = %s", PANEL_URL)
