@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Eternal Hosting 自动续期（优先），若检测到 VPN 拦截则自动降级为到期提醒
+Eternal Hosting 自动续期（优先），若续期失败则自动降级为到期提醒
 """
 
 import os
 import sys
 import re
 import time
+import json
 import logging
 import requests
 from datetime import datetime
@@ -20,11 +21,8 @@ LOGIN_URL = os.getenv("LOGIN_URL", f"{PANEL_URL}/login")
 INFO_PAGE = os.getenv("INFO_PAGE", f"/servers/{SERVER_ID}/info")
 RENEW_API = os.getenv("RENEW_API", f"/proxycheck-renew/{SERVER_ID}")
 WAIT = os.getenv("WAIT_FOR_COOLDOWN", "false").lower() == "true"
-
-# 提醒阈值（小时），默认 24 小时，仅降级时使用
 THRESHOLD_HOURS = float(os.getenv("THRESHOLD_HOURS", "24"))
 
-# Telegram 通知（可选，建议配置）
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
@@ -35,7 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ---------- 通用辅助函数 ----------
+# ---------- 辅助函数 ----------
 def check_env():
     missing = []
     if not USERNAME:
@@ -47,7 +45,6 @@ def check_env():
         sys.exit(1)
 
 def get_csrf_token_from_page(session, url):
-    """从 HTML 页面中提取 CSRF Token（meta 或 input）"""
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -68,7 +65,6 @@ def get_csrf_token_from_page(session, url):
         return None
 
 def parse_cooldown(html):
-    """从页面中解析冷却剩余时间（秒）"""
     match = re.search(r'<div[^>]*id="cooldown-display"[^>]*>(.*?)</div>', html, re.DOTALL)
     if match:
         text = match.group(1).strip()
@@ -98,7 +94,6 @@ def parse_cooldown(html):
     return 0
 
 def parse_expiry(html):
-    """从页面中解析 Expires 时间，返回 datetime 对象（假设 UTC）"""
     patterns = [
         r'Expires\s+([A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2})',
         r'Expires:\s*([A-Za-z]{3}\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2})',
@@ -116,7 +111,6 @@ def parse_expiry(html):
     return None
 
 def send_telegram(message):
-    """通过 Telegram 发送消息"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         logger.warning("未配置 Telegram 通知，跳过发送")
         return False
@@ -198,7 +192,7 @@ def check_and_handle_cooldown(session):
         logger.error("检查冷却失败: %s", e)
         return True
 
-# ---------- 核心续期函数（增强头部） ----------
+# ---------- 核心续期函数（增强头部，避免 zstd 压缩） ----------
 def renew_server(session):
     info_url = f"{PANEL_URL}{INFO_PAGE}"
     token = get_csrf_token_from_page(session, info_url)
@@ -215,12 +209,12 @@ def renew_server(session):
 
     logger.info("正在续期: %s", renew_url)
 
-    # ----- 补全所有浏览器头部（模仿真实请求） -----
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
+        # 只保留 gzip, deflate，去掉 zstd 和 br（避免解压问题）
+        "Accept-Encoding": "gzip, deflate",
         "Content-Type": "application/json",
         "Referer": info_url,
         "Origin": PANEL_URL,
@@ -230,7 +224,6 @@ def renew_server(session):
         "Priority": "u=1, i",
         "x-csrf-token": token,
     }
-    # 添加 X-XSRF-TOKEN（如果有 cookie）
     xsrf = session.cookies.get('XSRF-TOKEN')
     if xsrf:
         headers['X-XSRF-TOKEN'] = xsrf
@@ -243,23 +236,43 @@ def renew_server(session):
     try:
         resp = session.post(renew_url, json=payload, headers=headers, timeout=30)
         logger.info("响应状态码: %s", resp.status_code)
-        body = resp.text[:500]
-        logger.info("响应内容: %s", body)
-        resp.raise_for_status()
-        result = resp.json()
-        # 判断续期是否成功
-        if result.get("success") or result.get("status") == "success" or "success" in str(result).lower():
-            logger.info("✅ 续期成功！")
-            return True, None
-        else:
-            # 检查是否为 VPN 拦截
-            if "VPN or proxy detected" in body or "disable your VPN" in body:
-                logger.warning("⚠️ 续期被拦截：VPN/代理检测")
+        # 获取原始文本，并尝试多种编码解码
+        raw_content = resp.content
+        # 尝试用 utf-8 解码
+        try:
+            text = raw_content.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                text = raw_content.decode('latin-1')
+            except:
+                text = str(raw_content)  # 保底
+        logger.info("响应内容（前500字符）: %s", text[:500])
+
+        # 检查是否为 JSON
+        try:
+            result = json.loads(text)
+            # 判断续期是否成功
+            if result.get("success") or result.get("status") == "success" or "success" in str(result).lower():
+                logger.info("✅ 续期成功！")
+                return True, None
+            else:
+                # 检查是否为 VPN 拦截
+                if "VPN or proxy detected" in text or "disable your VPN" in text:
+                    logger.warning("⚠️ 续期被拦截：VPN/代理检测")
+                    return False, "vpn_blocked"
+                else:
+                    error_msg = result.get("message") or result.get("error") or "未知错误"
+                    logger.error("续期失败: %s", error_msg)
+                    return False, "other_error"
+        except json.JSONDecodeError:
+            # 非 JSON，检查是否包含 VPN 提示
+            if "VPN" in text or "proxy" in text or "disable" in text:
+                logger.warning("⚠️ 响应非 JSON，但可能包含 VPN 检测信息")
                 return False, "vpn_blocked"
             else:
-                error_msg = result.get("message") or result.get("error") or "未知错误"
-                logger.error("续期失败: %s", error_msg)
-                return False, "other_error"
+                logger.error("响应不是 JSON 格式，内容: %s", text[:200])
+                return False, "not_json"
+
     except requests.exceptions.HTTPError as e:
         logger.error("HTTP 错误: %s", e)
         if hasattr(e, 'response') and e.response:
@@ -275,7 +288,6 @@ def renew_server(session):
 
 # ---------- 降级提醒函数 ----------
 def send_expiry_reminder(session):
-    """获取到期时间并发送提醒"""
     info_url = f"{PANEL_URL}{INFO_PAGE}"
     logger.info("获取服务器信息: %s", info_url)
     try:
@@ -300,7 +312,7 @@ def send_expiry_reminder(session):
 
     if hours_left < THRESHOLD_HOURS:
         msg = (
-            f"⚠️ Eternal Hosting 服务器即将到期（自动续期因 IP 风控失败）\n"
+            f"⚠️ Eternal Hosting 服务器即将到期（自动续期失败）\n"
             f"服务器 ID: {SERVER_ID}\n"
             f"到期时间: {expiry.strftime('%Y-%m-%d %H:%M')} (UTC)\n"
             f"剩余时间: {hours_left:.1f} 小时\n"
@@ -332,22 +344,17 @@ def main():
     if not check_and_handle_cooldown(session):
         sys.exit(0)
 
-    # 尝试续期（自动）
+    # 尝试续期
     success, reason = renew_server(session)
     if success:
         logger.info("自动续期完成")
         sys.exit(0)
     else:
-        # 如果续期失败且原因是 VPN 拦截，降级为提醒模式
-        if reason == "vpn_blocked":
-            logger.info("由于 IP 风控，自动续期不可用，切换为到期提醒模式")
-            send_expiry_reminder(session)
-            sys.exit(0)   # 提醒发送后正常退出
-        else:
-            # 其他错误（如网络问题、CSRF 失效等），也尝试发送提醒以防万一
-            logger.warning("续期失败（原因: %s），尝试发送到期提醒", reason)
-            send_expiry_reminder(session)
-            sys.exit(1)   # 仍标记为失败
+        # 续期失败，执行降级提醒
+        logger.warning("续期失败（原因: %s），执行到期提醒", reason)
+        send_expiry_reminder(session)
+        # 提醒任务完成，正常退出（exit 0）
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
